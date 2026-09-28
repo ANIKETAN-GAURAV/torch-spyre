@@ -131,6 +131,104 @@ def test_metrics_absent_from_the_xml_stay_null(ingest, tmp_path):
     assert row["mem_size_mb"] is None
 
 
+def test_uncaptured_zero_metrics_are_not_stored_as_measurements(ingest):
+    """A metric the harness zero-filled on every record is absent, not measured."""
+    records = [
+        {
+            "operation_name": "a",
+            "spyre_ms": 1.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+        {
+            "operation_name": "b",
+            "spyre_ms": 2.0,
+            "pt_util_percent": 0.0,
+            "compile_ms": 0.0,
+        },
+    ]
+    for entry in ingest._bench_entries(records):
+        assert set(entry["measurements"]) == {"spyre_ms"}
+
+
+def test_a_zero_beside_captured_values_is_kept(ingest):
+    records = [
+        {"operation_name": "a", "pt_util_percent": 0.0, "memory_transfer_mean_ms": 0.0},
+        {
+            "operation_name": "b",
+            "pt_util_percent": 42.0,
+            "memory_transfer_mean_ms": 0.0,
+        },
+    ]
+    a, b = ingest._bench_entries(records)
+    assert a["measurements"]["pt_util_percent"] == [0.0]
+    assert b["measurements"]["pt_util_percent"] == [42.0]
+    # Not a zero-filled metric: an all-zero column is still a measurement.
+    assert a["measurements"]["memory_transfer_mean_ms"] == [0.0]
+
+
+def test_torch_spyre_ms_is_not_duplicated_into_measurements(ingest):
+    (entry,) = ingest._bench_entries(
+        [
+            {
+                "operation_name": "a",
+                "metric": "spyre_kernel_ms",
+                "duration_ms": 3.0,
+                "torch_spyre_ms": 3.0,
+            }
+        ]
+    )
+    assert entry["measurements"] == {"duration_ms": [3.0]}
+    assert entry["backend"] == "spyre"
+
+
+def test_report_records_fall_back_to_the_spyre_backend(ingest):
+    (report,) = ingest._bench_entries([{"operation_name": "a", "spyre_ms": 1.0}])
+    (sendnn,) = ingest._bench_entries([{"operation_name": "a", "sendnn_ms": 1.0}])
+    assert report["backend"] == "spyre"
+    assert sendnn["backend"] == "sendnn"
+
+
+@pytest.mark.parametrize(
+    ("argv", "component"),
+    [([], "torch-spyre"), (["--component", "hf-adapters"], "hf-adapters")],
+)
+def test_benchmarks_are_stamped_with_the_callers_component(
+    ingest, monkeypatch, tmp_path, argv, component
+):
+    xml = _write_suite(
+        tmp_path,
+        _hf_case(f"perf_matmul_wall_clock_ms_{SHAPES}", "12.5"),
+        version_info=FULL_PROVENANCE,
+    )
+    written = []
+    monkeypatch.setenv("CLICKHOUSE_DB_V2", "v2")
+    monkeypatch.setattr(ingest, "benchmark_tables_present", lambda *a: True)
+    monkeypatch.setattr(ingest, "benchmarks_already_ingested", lambda *a: False)
+    monkeypatch.setattr(
+        ingest,
+        "insert_benchmarks",
+        lambda client, db, comp, run_id, entries, **kw: written.append(comp)
+        or len(entries),
+    )
+    _run_main(
+        ingest,
+        monkeypatch,
+        xml,
+        FakeClient(dict(FULL_RUN_SCHEMA)),
+        extra_argv=[
+            "--trigger-type",
+            "perf",
+            "--schema",
+            "both",
+            "--gha-run-id",
+            "7",
+            *argv,
+        ],
+    )
+    assert written == [component]
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -718,3 +816,24 @@ def test_a_write_failure_never_propagates(ingest):
 
     legs = {(_RUN_ID, "regression"): {"failed": 0, "total": 1, "duration_s": 1.0}}
     ingest._write_artifact_verdicts(Boom(), "db", _args(), legs)
+
+
+def test_a_repeated_testcase_is_one_row_and_the_last_attempt_wins(ingest, tmp_path):
+    path = tmp_path / "suite.xml"
+    path.write_text(
+        "<testsuites><testsuite name='pytest'>"
+        "<testcase classname='c' name='test_a' time='1'><failure message='x'/></testcase>"
+        "<testcase classname='c' name='test_b' time='2'/>"
+        "<testcase classname='c' name='test_a' time='3'/>"
+        "<testcase classname='c' name='test_B' time='4'/>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    run, cases = ingest.parse_test_xml(path)
+    by_name = {c["name"]: c for c in cases}
+    # Exact match only: test_b and test_B are different tests.
+    assert sorted(by_name) == ["test_B", "test_a", "test_b"]
+    assert by_name["test_a"]["status"] == "passed"
+    assert by_name["test_a"]["duration_s"] == 3.0
+    assert run["total_tests"] == 3
+    assert run["failed"] == 0
